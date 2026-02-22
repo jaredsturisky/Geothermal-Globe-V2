@@ -1,18 +1,15 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import DeckGL from '@deck.gl/react';
 import { BitmapLayer, PathLayer, ScatterplotLayer } from '@deck.gl/layers';
-import { HeatmapLayer } from '@deck.gl/aggregation-layers';
 import { TileLayer } from '@deck.gl/geo-layers';
-import { FlyToInterpolator } from '@deck.gl/core';
+import { _GlobeView as GlobeView, FlyToInterpolator } from '@deck.gl/core';
 
 const INITIAL_VIEW_STATE = {
   longitude: 0,
   latitude: 20,
   zoom: 1.5,
-  minZoom: 1,
-  maxZoom: 15,
-  pitch: 0,
-  bearing: 0,
+  minZoom: 0,
+  maxZoom: 20,
 };
 
 const COLOR_RANGE = [
@@ -23,6 +20,24 @@ const COLOR_RANGE = [
   [254, 173, 84],
   [209, 55, 78],
 ];
+
+function scoreToColor(score) {
+  const t = Math.max(0, Math.min(1, score));
+  const i = t * (COLOR_RANGE.length - 1);
+  const lo = Math.floor(i);
+  const hi = Math.min(lo + 1, COLOR_RANGE.length - 1);
+  const f = i - lo;
+  const a = COLOR_RANGE[lo];
+  const b = COLOR_RANGE[hi];
+  return [
+    Math.round(a[0] + f * (b[0] - a[0])),
+    Math.round(a[1] + f * (b[1] - a[1])),
+    Math.round(a[2] + f * (b[2] - a[2])),
+    180,
+  ];
+}
+
+const GLOBE_VIEW = new GlobeView({ id: 'globe', controller: true });
 
 const PANEL = {
   position: 'absolute',
@@ -35,14 +50,26 @@ const PANEL = {
   fontSize: 12,
 };
 
+function formatPlaceFromNominatim(result) {
+  if (!result) return null;
+  const addr = result.address || {};
+  const city = addr.city || addr.town || addr.village || addr.municipality || addr.county;
+  const region = addr.state || addr.region || addr.country;
+  if (city && region) return `${city}, ${region}`;
+  return region || city || result.display_name || null;
+}
+
 export default function GeothermalGlobe() {
+  const [started, setStarted] = useState(false);
   const [data, setData] = useState([]);
   const [boundaries, setBoundaries] = useState([]);
   const [topSites, setTopSites] = useState([]);
   const [showBoundaries, setShowBoundaries] = useState(true);
   const [showSidebar, setShowSidebar] = useState(true);
   const [selected, setSelected] = useState(null);
-  const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
+  const [locationPlace, setLocationPlace] = useState(null);
+  const [locationPlaceLoading, setLocationPlaceLoading] = useState(false);
+  const [viewState, setViewState] = useState({ globe: INITIAL_VIEW_STATE });
 
   useEffect(() => {
     Promise.all([
@@ -56,14 +83,49 @@ export default function GeothermalGlobe() {
     });
   }, []);
 
+  // Reverse geocode selected location for city/region (Nominatim, no key required)
+  useEffect(() => {
+    if (!selected?.coordinates?.length) {
+      setLocationPlace(null);
+      setLocationPlaceLoading(false);
+      return;
+    }
+    const [lon, lat] = selected.coordinates;
+    setLocationPlace(null);
+    setLocationPlaceLoading(true);
+    const controller = new AbortController();
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`;
+    fetch(url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'Runtime-Terror-Geothermal-App',
+      },
+      signal: controller.signal,
+      referrerPolicy: 'no-referrer',
+    })
+      .then((r) => r.json())
+      .then((data) => {
+        setLocationPlace(formatPlaceFromNominatim(data));
+        setLocationPlaceLoading(false);
+      })
+      .catch(() => {
+        setLocationPlace(null);
+        setLocationPlaceLoading(false);
+      });
+    return () => controller.abort();
+  }, [selected?.coordinates?.[0], selected?.coordinates?.[1]]);
+
   const flyTo = useCallback((lon, lat) => {
     setViewState((prev) => ({
       ...prev,
-      longitude: lon,
-      latitude: lat,
-      zoom: 6,
-      transitionDuration: 1500,
-      transitionInterpolator: new FlyToInterpolator(),
+      globe: {
+        ...prev.globe,
+        longitude: lon,
+        latitude: lat,
+        zoom: 6,
+        transitionDuration: 1500,
+        transitionInterpolator: new FlyToInterpolator(),
+      },
     }));
   }, []);
 
@@ -71,17 +133,31 @@ export default function GeothermalGlobe() {
     setSelected(point);
   }, []);
 
-  // Find nearest data point to a clicked map coordinate
+  // Find nearest data point to a clicked map coordinate (or use clicked heat dot)
   const handleMapClick = useCallback(
     ({ coordinate, object, layer }) => {
-      // Top-site pin clicks are handled by their layer's onClick — skip here
       if (object && layer?.id === 'top-sites') return;
+      if (object && layer?.id === 'heatmap-dots') {
+        selectPoint(object);
+        return;
+      }
       if (!coordinate || !data.length) return;
+
+      const extent = data.reduce(
+        (acc, d) => {
+          const s = d.score ?? 0;
+          return { min: Math.min(acc.min, s), max: Math.max(acc.max, s) };
+        },
+        { min: Infinity, max: -Infinity }
+      );
+      const range = extent.max - extent.min || 1;
+      const norm = (s) => (Math.max(extent.min, Math.min(extent.max, s ?? 0)) - extent.min) / range;
+      const highOnly = data.filter((pt) => norm(pt.score) >= 0.5);
 
       const [clickLon, clickLat] = coordinate;
       let nearest = null;
       let minDist = Infinity;
-      for (const pt of data) {
+      for (const pt of highOnly) {
         const [lon, lat] = pt.coordinates;
         const d = (lon - clickLon) ** 2 + (lat - clickLat) ** 2;
         if (d < minDist) {
@@ -113,15 +189,35 @@ export default function GeothermalGlobe() {
       },
     });
 
-    const heatmap = new HeatmapLayer({
-      id: 'heatmap',
-      data,
+    // Normalize score to 0–1 over current data range for color scale
+    const scoreExtent =
+      data.length > 0
+        ? data.reduce(
+            (acc, d) => {
+              const s = d.score ?? 0;
+              return { min: Math.min(acc.min, s), max: Math.max(acc.max, s) };
+            },
+            { min: Infinity, max: -Infinity }
+          )
+        : { min: 0, max: 1 };
+    const scoreRange = scoreExtent.max - scoreExtent.min || 1;
+    const normalizeScore = (s) =>
+      (Math.max(scoreExtent.min, Math.min(scoreExtent.max, s ?? 0)) - scoreExtent.min) / scoreRange;
+
+    // Only show yellow, orange, or red dots (normalized score >= 0.5)
+    const HIGH_POTENTIAL_THRESHOLD = 0.5;
+    const highPotentialData = data.filter((d) => normalizeScore(d.score) >= HIGH_POTENTIAL_THRESHOLD);
+
+    // Globe-compatible replacement for HeatmapLayer: scatter points colored by score
+    const heatmapDots = new ScatterplotLayer({
+      id: 'heatmap-dots',
+      data: highPotentialData,
       getPosition: (d) => d.coordinates,
-      getWeight: (d) => d.score,
-      radiusPixels: 60,
-      intensity: 1,
-      threshold: 0.03,
-      colorRange: COLOR_RANGE,
+      getRadius: 28000,
+      radiusUnits: 'meters',
+      getFillColor: (d) => scoreToColor(normalizeScore(d.score)),
+      stroked: false,
+      pickable: true,
     });
 
     const boundaryLayer = showBoundaries
@@ -162,7 +258,7 @@ export default function GeothermalGlobe() {
       },
     });
 
-    return [basemap, heatmap, boundaryLayer, pinsLayer].filter(Boolean);
+    return [basemap, heatmapDots, boundaryLayer, pinsLayer].filter(Boolean);
   }, [data, boundaries, topSites, showBoundaries, selected, selectPoint, flyTo]);
 
   const [selLon, selLat] = selected?.coordinates ?? [0, 0];
@@ -170,15 +266,88 @@ export default function GeothermalGlobe() {
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
       <DeckGL
+        views={[GLOBE_VIEW]}
         viewState={viewState}
-        onViewStateChange={({ viewState: vs }) => setViewState(vs)}
-        controller={true}
+        onViewStateChange={({ viewId, viewState: vs }) =>
+          setViewState((prev) => ({ ...prev, [viewId]: vs }))
+        }
         layers={layers}
         onClick={handleMapClick}
         getCursor={() => 'crosshair'}
-        parameters={{ clearColor: [0.02, 0.02, 0.02, 1] }}
+        parameters={{ clearColor: [0.02, 0.02, 0.02, 1], cull: true }}
         style={{ width: '100%', height: '100%' }}
       />
+
+      {/* ── Intro overlay (blurred map + description + Start) ─── */}
+      {!started && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            background: 'rgba(8, 8, 18, 0.5)',
+            backdropFilter: 'blur(12px)',
+            WebkitBackdropFilter: 'blur(12px)',
+            transition: 'opacity 0.4s ease',
+            zIndex: 10,
+          }}
+        >
+          <div
+            style={{
+              ...PANEL,
+              maxWidth: 420,
+              padding: 28,
+              textAlign: 'center',
+              boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
+            }}
+          >
+            <h1
+              style={{
+                margin: '0 0 14px',
+                color: '#f97316',
+                fontWeight: 'bold',
+                letterSpacing: 2,
+                fontSize: 16,
+              }}
+            >
+              GEOTHERMAL POTENTIAL
+            </h1>
+            <p
+              style={{
+                margin: '0 0 24px',
+                color: '#b0b0b0',
+                fontSize: 13,
+                lineHeight: 1.6,
+              }}
+            >
+              This app helps you explore global geothermal energy potential. Use the map to view heat-flow data and composite scores, compare top sites, and inspect plate boundaries. Click the map or the Top 20 list to zoom to a location and see detailed stats.
+            </p>
+            <button
+              onClick={() => setStarted(true)}
+              style={{
+                background: '#f97316',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 6,
+                padding: '10px 28px',
+                fontSize: 13,
+                fontWeight: 'bold',
+                letterSpacing: 1,
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+                transition: 'background 0.2s, transform 0.1s',
+              }}
+              onMouseDown={(e) => (e.currentTarget.style.transform = 'scale(0.98)')}
+              onMouseUp={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+              onMouseLeave={(e) => (e.currentTarget.style.transform = 'scale(1)')}
+            >
+              Start
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── Top bar ─────────────────────────────────────────── */}
       <div
@@ -305,7 +474,8 @@ export default function GeothermalGlobe() {
             </span>
           </div>
 
-          <StatRow label="Location" value={`${selLat.toFixed(3)}°, ${selLon.toFixed(3)}°`} />
+          <StatRow label="Coordinates" value={`${selLat.toFixed(3)}°, ${selLon.toFixed(3)}°`} />
+          <StatRow label="City / Region" value={locationPlaceLoading ? 'Loading…' : (locationPlace ?? '—')} />
           <StatRow label="Composite score" value={selected.score?.toFixed(4) ?? '—'} accent />
           <StatRow label="Heat flow" value={selected.hf != null ? `${selected.hf} mW/m²` : '—'} />
           <StatRow label="Plate boundary" value={selected.bd != null ? `${selected.bd} km` : '—'} />
