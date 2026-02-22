@@ -3,6 +3,7 @@ import DeckGL from '@deck.gl/react';
 import { BitmapLayer, PathLayer, ScatterplotLayer } from '@deck.gl/layers';
 import { TileLayer } from '@deck.gl/geo-layers';
 import { _GlobeView as GlobeView, FlyToInterpolator } from '@deck.gl/core';
+import { resolveLocation } from './src/location/resolveLocation.js';
 
 const INITIAL_VIEW_STATE = {
   longitude: 0,
@@ -50,15 +51,6 @@ const PANEL = {
   fontSize: 12,
 };
 
-function formatPlaceFromNominatim(result) {
-  if (!result) return null;
-  const addr = result.address || {};
-  const city = addr.city || addr.town || addr.village || addr.municipality || addr.county;
-  const region = addr.state || addr.region || addr.country;
-  if (city && region) return `${city}, ${region}`;
-  return region || city || result.display_name || null;
-}
-
 export default function GeothermalGlobe() {
   const [started, setStarted] = useState(false);
   const [data, setData] = useState([]);
@@ -67,8 +59,11 @@ export default function GeothermalGlobe() {
   const [showBoundaries, setShowBoundaries] = useState(true);
   const [showSidebar, setShowSidebar] = useState(true);
   const [selected, setSelected] = useState(null);
-  const [locationPlace, setLocationPlace] = useState(null);
-  const [locationPlaceLoading, setLocationPlaceLoading] = useState(false);
+  /** Click position in WGS84: [longitude, latitude] from DeckGL. Used for location resolution and display. */
+  const [clickCoordinate, setClickCoordinate] = useState(null);
+  /** Resolved from resolveLocation(lat, lon): { label, country, lat, lon }. Polygon containment, no external API. */
+  const [resolvedLocation, setResolvedLocation] = useState(null);
+  const [locationResolving, setLocationResolving] = useState(false);
   const [viewState, setViewState] = useState({ globe: INITIAL_VIEW_STATE });
 
   useEffect(() => {
@@ -82,38 +77,6 @@ export default function GeothermalGlobe() {
       setTopSites(sites);
     });
   }, []);
-
-  // Reverse geocode selected location for city/region (Nominatim, no key required)
-  useEffect(() => {
-    if (!selected?.coordinates?.length) {
-      setLocationPlace(null);
-      setLocationPlaceLoading(false);
-      return;
-    }
-    const [lon, lat] = selected.coordinates;
-    setLocationPlace(null);
-    setLocationPlaceLoading(true);
-    const controller = new AbortController();
-    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`;
-    fetch(url, {
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'Runtime-Terror-Geothermal-App',
-      },
-      signal: controller.signal,
-      referrerPolicy: 'no-referrer',
-    })
-      .then((r) => r.json())
-      .then((data) => {
-        setLocationPlace(formatPlaceFromNominatim(data));
-        setLocationPlaceLoading(false);
-      })
-      .catch(() => {
-        setLocationPlace(null);
-        setLocationPlaceLoading(false);
-      });
-    return () => controller.abort();
-  }, [selected?.coordinates?.[0], selected?.coordinates?.[1]]);
 
   const flyTo = useCallback((lon, lat) => {
     setViewState((prev) => ({
@@ -133,16 +96,88 @@ export default function GeothermalGlobe() {
     setSelected(point);
   }, []);
 
-  // Find nearest data point to a clicked map coordinate (or use clicked heat dot)
+  // Resolve click to location (country/ocean) and optionally nearest heat dot. DeckGL passes coordinate as [longitude, latitude] in WGS84.
   const handleMapClick = useCallback(
     ({ coordinate, object, layer }) => {
-      if (object && layer?.id === 'top-sites') return;
+      if (object && layer?.id === 'top-sites') {
+        setClickCoordinate([object.lon, object.lat]);
+        setLocationResolving(true);
+        resolveLocation(object.lat, object.lon)
+          .then((res) => {
+            setResolvedLocation(res);
+            setLocationResolving(false);
+            console.log('Click (pin)', { lat: res.lat.toFixed(4), lon: res.lon.toFixed(4), label: res.label });
+          })
+          .catch((err) => {
+            console.error('resolveLocation failed', err);
+            setResolvedLocation({
+              country: null,
+              region: null,
+              city: null,
+              label: 'Unable to load map data',
+              lat: object.lat,
+              lon: object.lon,
+            });
+            setLocationResolving(false);
+          });
+        selectPoint({
+          coordinates: [object.lon, object.lat],
+          score: object.score,
+          hf: object.hf,
+          bd: object.bd,
+        });
+        flyTo(object.lon, object.lat);
+        return;
+      }
       if (object && layer?.id === 'heatmap-dots') {
+        const [lon, lat] = object.coordinates;
+        setClickCoordinate([lon, lat]);
+        setLocationResolving(true);
+        resolveLocation(lat, lon)
+          .then((res) => {
+            setResolvedLocation(res);
+            setLocationResolving(false);
+            console.log('Click (heat dot)', { lat: res.lat.toFixed(4), lon: res.lon.toFixed(4), label: res.label });
+          })
+          .catch((err) => {
+            console.error('resolveLocation failed', err);
+            setResolvedLocation({
+              country: null,
+              region: null,
+              city: null,
+              label: 'Unable to load map data',
+              lat,
+              lon,
+            });
+            setLocationResolving(false);
+          });
         selectPoint(object);
         return;
       }
-      if (!coordinate || !data.length) return;
+      if (!coordinate) return;
+      const [clickLon, clickLat] = coordinate;
+      setClickCoordinate(coordinate);
+      setLocationResolving(true);
+      resolveLocation(clickLat, clickLon)
+        .then((res) => {
+          setResolvedLocation(res);
+          setLocationResolving(false);
+          console.log('Click', { lat: res.lat.toFixed(4), lon: res.lon.toFixed(4), label: res.label });
+        })
+        .catch((err) => {
+          console.error('resolveLocation failed', err);
+          setResolvedLocation({
+            country: null,
+            region: null,
+            city: null,
+            label: 'Unable to load map data',
+            lat: clickLat,
+            lon: clickLon,
+          });
+          setLocationResolving(false);
+        });
 
+      if (!data.length) return;
       const extent = data.reduce(
         (acc, d) => {
           const s = d.score ?? 0;
@@ -153,8 +188,6 @@ export default function GeothermalGlobe() {
       const range = extent.max - extent.min || 1;
       const norm = (s) => (Math.max(extent.min, Math.min(extent.max, s ?? 0)) - extent.min) / range;
       const highOnly = data.filter((pt) => norm(pt.score) >= 0.5);
-
-      const [clickLon, clickLat] = coordinate;
       let nearest = null;
       let minDist = Infinity;
       for (const pt of highOnly) {
@@ -167,7 +200,7 @@ export default function GeothermalGlobe() {
       }
       selectPoint(nearest);
     },
-    [data, selectPoint]
+    [data, selectPoint, flyTo]
   );
 
   const layers = useMemo(() => {
@@ -178,9 +211,7 @@ export default function GeothermalGlobe() {
       maxZoom: 19,
       tileSize: 256,
       renderSubLayers: (props) => {
-        const {
-          tile: { bbox },
-        } = props;
+        const { tile: { bbox } } = props;
         return new BitmapLayer(props, {
           data: null,
           image: props.data,
@@ -262,6 +293,8 @@ export default function GeothermalGlobe() {
   }, [data, boundaries, topSites, showBoundaries, selected, selectPoint, flyTo]);
 
   const [selLon, selLat] = selected?.coordinates ?? [0, 0];
+  const displayLat = resolvedLocation?.lat ?? clickCoordinate?.[1] ?? selLat;
+  const displayLon = resolvedLocation?.lon ?? clickCoordinate?.[0] ?? selLon;
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
@@ -422,6 +455,25 @@ export default function GeothermalGlobe() {
               <div
                 key={site.rank}
                 onClick={() => {
+                  setClickCoordinate([site.lon, site.lat]);
+                  setLocationResolving(true);
+                  resolveLocation(site.lat, site.lon)
+                    .then((res) => {
+                      setResolvedLocation(res);
+                      setLocationResolving(false);
+                    })
+                    .catch((err) => {
+                      console.error('resolveLocation failed', err);
+                      setResolvedLocation({
+                        country: null,
+                        region: null,
+                        city: null,
+                        label: 'Unable to load map data',
+                        lat: site.lat,
+                        lon: site.lon,
+                      });
+                      setLocationResolving(false);
+                    });
                   selectPoint({
                     coordinates: [site.lon, site.lat],
                     score: site.score,
@@ -459,41 +511,68 @@ export default function GeothermalGlobe() {
         </div>
       )}
 
-      {/* ── Right panel — selected site detail ──────────────── */}
-      {selected && (
+      {/* ── Debug overlay: last click lat/lon (4 decimals) and resolved label ─── */}
+      {clickCoordinate != null && resolvedLocation && (
+        <div
+          style={{
+            ...PANEL,
+            bottom: 24,
+            left: 12,
+            padding: '8px 12px',
+            fontSize: 11,
+            maxWidth: 320,
+          }}
+        >
+          <div style={{ color: '#888', marginBottom: 4 }}>Last click (WGS84)</div>
+          <div style={{ color: '#ddd', fontFamily: 'monospace' }}>
+            lat {resolvedLocation.lat.toFixed(4)}°, lon {resolvedLocation.lon.toFixed(4)}°
+          </div>
+          <div style={{ color: '#f97316', marginTop: 4 }}>{resolvedLocation.label}</div>
+        </div>
+      )}
+
+      {/* ── Right panel — location and optional site detail ──────────────── */}
+      {clickCoordinate != null && (
         <div style={{ ...PANEL, top: 56, right: 12, width: 268, padding: 14 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
             <span style={{ color: '#f97316', fontWeight: 'bold', fontSize: 10, letterSpacing: 2 }}>
               SITE ANALYSIS
             </span>
             <span
-              onClick={() => setSelected(null)}
+              onClick={() => {
+                setSelected(null);
+                setClickCoordinate(null);
+                setResolvedLocation(null);
+                setLocationResolving(false);
+              }}
               style={{ cursor: 'pointer', color: '#555', fontSize: 14, lineHeight: 1 }}
             >
               ✕
             </span>
           </div>
 
-          <StatRow label="Coordinates" value={`${selLat.toFixed(3)}°, ${selLon.toFixed(3)}°`} />
-          <StatRow label="City / Region" value={locationPlaceLoading ? 'Loading…' : (locationPlace ?? '—')} />
-          <StatRow label="Composite score" value={selected.score?.toFixed(4) ?? '—'} accent />
-          <StatRow label="Heat flow" value={selected.hf != null ? `${selected.hf} mW/m²` : '—'} />
-          <StatRow label="Plate boundary" value={selected.bd != null ? `${selected.bd} km` : '—'} />
+          <StatRow label="Coordinates" value={`${displayLat.toFixed(4)}°, ${displayLon.toFixed(4)}°`} />
+          <StatRow label="Location" value={locationResolving ? 'Loading…' : (resolvedLocation?.label ?? '—')} />
+          <StatRow label="Composite score" value={selected?.score?.toFixed(4) ?? '—'} accent />
+          <StatRow label="Heat flow" value={selected?.hf != null ? `${selected.hf} mW/m²` : '—'} />
+          <StatRow label="Plate boundary" value={selected?.bd != null ? `${selected.bd} km` : '—'} />
 
-          {/* Score bar */}
-          <div style={{ marginTop: 10 }}>
-            <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.08)' }}>
-              <div
-                style={{
-                  height: '100%',
-                  width: `${(selected.score ?? 0) * 100}%`,
-                  borderRadius: 2,
-                  background: 'linear-gradient(90deg, #1d9abf, #f97316)',
-                  transition: 'width 0.3s',
-                }}
-              />
+          {/* Score bar — only when a heat/site point is selected */}
+          {selected != null && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.08)' }}>
+                <div
+                  style={{
+                    height: '100%',
+                    width: `${(selected.score ?? 0) * 100}%`,
+                    borderRadius: 2,
+                    background: 'linear-gradient(90deg, #1d9abf, #f97316)',
+                    transition: 'width 0.3s',
+                  }}
+                />
+              </div>
             </div>
-          </div>
+          )}
         </div>
       )}
     </div>

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "validate-location": "node scripts/validate-location.mjs"
   },
   "dependencies": {
     "@deck.gl/aggregation-layers": "^9.2.9",
@@ -14,6 +15,9 @@
     "@deck.gl/geo-layers": "^9.2.9",
     "@deck.gl/layers": "^9.2.9",
     "@deck.gl/react": "^9.2.9",
+    "@turf/bbox": "^7.3.4",
+    "@turf/boolean-point-in-polygon": "^7.3.4",
+    "@turf/helpers": "^7.3.4",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
