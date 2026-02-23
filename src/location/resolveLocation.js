@@ -134,8 +134,12 @@ export function resolveLocationWithCollection(lat, lon, collection) {
   return result;
 }
 
+/** Country name(s) that trigger US state lookup (Natural Earth may use either). */
+const USA_COUNTRY_NAMES = ['United States of America', 'United States'];
+
 /**
  * Resolve (latitude, longitude) to country or ocean label using polygon containment.
+ * When the country is the USA, an additional state lookup runs and the label becomes "State, USA".
  *
  * @param {number} lat - Latitude in WGS84 (-90 to 90)
  * @param {number} lon - Longitude in WGS84 (any range; normalized to -180..180)
@@ -143,5 +147,16 @@ export function resolveLocationWithCollection(lat, lon, collection) {
  */
 export async function resolveLocation(lat, lon) {
   const collection = await loadCountries();
-  return resolveLocationWithCollection(lat, lon, collection);
+  let result = resolveLocationWithCollection(lat, lon, collection);
+
+  if (USA_COUNTRY_NAMES.includes(result.country)) {
+    const { resolveUSState } = await import('./resolveUSState.js');
+    const stateName = resolveUSState(lat, lon);
+    if (stateName) {
+      result = { ...result, label: `${stateName}, USA` };
+      console.log('Resolved USA state:', stateName);
+    }
+  }
+
+  return result;
 }
