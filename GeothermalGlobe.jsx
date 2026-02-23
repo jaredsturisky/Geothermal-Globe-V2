@@ -4,6 +4,8 @@ import { BitmapLayer, PathLayer, ScatterplotLayer } from '@deck.gl/layers';
 import { TileLayer } from '@deck.gl/geo-layers';
 import { _GlobeView as GlobeView, FlyToInterpolator } from '@deck.gl/core';
 import { resolveLocation } from './src/location/resolveLocation.js';
+import { parseResolvedPlace, getContinentFromCountry, CONTINENT_OPTIONS } from './src/location/regionUtils.js';
+import InfoModal from './src/InfoModal.jsx';
 
 const INITIAL_VIEW_STATE = {
   longitude: 0,
@@ -51,32 +53,96 @@ const PANEL = {
   fontSize: 12,
 };
 
+/** Proxy score breakdown from available fields (hf, bd). Used for compare-mode explanation. */
+function getScoreBreakdown(site) {
+  if (!site) return { heatFlowComponent: 0, boundaryDistanceKm: null };
+  return {
+    heatFlowComponent: site.hf ?? 0,
+    boundaryDistanceKm: site.bd ?? null,
+  };
+}
+
+/** Build winner explanation from score components (higher heat flow better, lower bd better). */
+function getWinnerExplanation(slotA, slotB) {
+  const a = getScoreBreakdown(slotA);
+  const b = getScoreBreakdown(slotB);
+  const winner = (slotA?.score ?? 0) >= (slotB?.score ?? 0) ? 'A' : 'B';
+  const parts = [];
+  if (winner === 'A') {
+    const hfDiff = (a.heatFlowComponent ?? 0) - (b.heatFlowComponent ?? 0);
+    const bdDiff = (b.boundaryDistanceKm ?? 0) - (a.boundaryDistanceKm ?? 0);
+    if (hfDiff > 0) parts.push(`higher heat flow (+${hfDiff.toFixed(0)} mW/m²)`);
+    if (bdDiff > 0) parts.push(`closer to plate boundary (−${bdDiff.toFixed(1)} km)`);
+  } else {
+    const hfDiff = (b.heatFlowComponent ?? 0) - (a.heatFlowComponent ?? 0);
+    const bdDiff = (a.boundaryDistanceKm ?? 0) - (b.boundaryDistanceKm ?? 0);
+    if (hfDiff > 0) parts.push(`higher heat flow (+${hfDiff.toFixed(0)} mW/m²)`);
+    if (bdDiff > 0) parts.push(`closer to plate boundary (−${bdDiff.toFixed(1)} km)`);
+  }
+  if (parts.length === 0) return 'Scores are very close.';
+  return `${winner} wins because it has ${parts.join(' and ')}.`;
+}
+
+const BATCH_SIZE = 150;
+
 export default function GeothermalGlobe() {
   const [started, setStarted] = useState(false);
   const [data, setData] = useState([]);
   const [boundaries, setBoundaries] = useState([]);
-  const [topSites, setTopSites] = useState([]);
+  const [enrichedData, setEnrichedData] = useState(null);
   const [showBoundaries, setShowBoundaries] = useState(true);
   const [showSidebar, setShowSidebar] = useState(true);
   const [selected, setSelected] = useState(null);
-  /** Click position in WGS84: [longitude, latitude] from DeckGL. Used for location resolution and display. */
   const [clickCoordinate, setClickCoordinate] = useState(null);
-  /** Resolved from resolveLocation(lat, lon): { label, country, lat, lon }. Polygon containment, no external API. */
   const [resolvedLocation, setResolvedLocation] = useState(null);
   const [locationResolving, setLocationResolving] = useState(false);
   const [viewState, setViewState] = useState({ globe: INITIAL_VIEW_STATE });
+  const [potentialThreshold, setPotentialThreshold] = useState(0.5);
+  const [continentFilter, setContinentFilter] = useState('All');
+  const [countryFilter, setCountryFilter] = useState('All');
+  const [compareMode, setCompareMode] = useState(false);
+  const [compareSlotA, setCompareSlotA] = useState(null);
+  const [compareSlotB, setCompareSlotB] = useState(null);
 
   useEffect(() => {
     Promise.all([
       fetch('/geothermal_data.json').then((r) => r.json()),
       fetch('/plate_boundaries.json').then((r) => r.json()),
-      fetch('/top_sites.json').then((r) => r.json()),
-    ]).then(([geo, bounds, sites]) => {
+    ]).then(([geo, bounds]) => {
       setData(geo);
       setBoundaries(bounds);
-      setTopSites(sites);
     });
   }, []);
+
+  useEffect(() => {
+    if (!data.length) return;
+    let cancelled = false;
+    (async () => {
+      const enriched = [];
+      for (let i = 0; i < data.length; i += BATCH_SIZE) {
+        if (cancelled) return;
+        const batch = data.slice(i, i + BATCH_SIZE);
+        const results = await Promise.all(
+          batch.map(async (pt) => {
+            const [lon, lat] = pt.coordinates;
+            const res = await resolveLocation(lat, lon).catch(() => ({ label: 'Unknown' }));
+            const { countryName, stateName } = parseResolvedPlace(res.label);
+            const continentName = getContinentFromCountry(countryName);
+            return {
+              ...pt,
+              resolvedPlace: res.label,
+              countryName,
+              stateName,
+              continentName,
+            };
+          })
+        );
+        enriched.push(...results);
+      }
+      if (!cancelled) setEnrichedData(enriched);
+    })();
+    return () => { cancelled = true; };
+  }, [data]);
 
   const flyTo = useCallback((lon, lat) => {
     setViewState((prev) => ({
@@ -96,62 +162,165 @@ export default function GeothermalGlobe() {
     setSelected(point);
   }, []);
 
-  // Resolve click to location (country/ocean) and optionally nearest heat dot. DeckGL passes coordinate as [longitude, latitude] in WGS84.
+  const sourceForFilter = enrichedData ?? data.map((pt) => ({ ...pt, resolvedPlace: '', countryName: '', stateName: null, continentName: 'Other' }));
+  const filteredSites = useMemo(() => {
+    return sourceForFilter.filter((pt) => {
+      if (continentFilter !== 'All' && pt.continentName !== continentFilter) return false;
+      if (countryFilter !== 'All' && pt.countryName !== countryFilter) return false;
+      return true;
+    });
+  }, [sourceForFilter, continentFilter, countryFilter]);
+
+  const { topSitesComputed, uniqueCountries } = useMemo(() => {
+    const scoreExtent =
+      filteredSites.length > 0
+        ? filteredSites.reduce(
+            (acc, d) => {
+              const s = d.score ?? 0;
+              return { min: Math.min(acc.min, s), max: Math.max(acc.max, s) };
+            },
+            { min: Infinity, max: -Infinity }
+          )
+        : { min: 0, max: 1 };
+    const scoreRange = scoreExtent.max - scoreExtent.min || 1;
+    const normalizeScore = (s) =>
+      (Math.max(scoreExtent.min, Math.min(scoreExtent.max, s ?? 0)) - scoreExtent.min) / scoreRange;
+    const aboveThreshold = filteredSites.filter((d) => normalizeScore(d.score) >= potentialThreshold);
+    const sorted = [...aboveThreshold].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    const top20 = sorted.slice(0, 20).map((site, i) => {
+      const [lon, lat] = site.coordinates;
+      return { ...site, rank: i + 1, lon, lat };
+    });
+    const countries = [...new Set(sourceForFilter.map((pt) => pt.countryName).filter(Boolean))].sort();
+    return { topSitesComputed: top20, uniqueCountries: countries };
+  }, [filteredSites, potentialThreshold, sourceForFilter]);
+
   const handleMapClick = useCallback(
     ({ coordinate, object, layer }) => {
-      if (object && layer?.id === 'top-sites') {
-        setClickCoordinate([object.lon, object.lat]);
-        setLocationResolving(true);
-        resolveLocation(object.lat, object.lon)
-          .then((res) => {
-            setResolvedLocation(res);
-            setLocationResolving(false);
-            console.log('Click (pin)', { lat: res.lat.toFixed(4), lon: res.lon.toFixed(4), label: res.label });
-          })
-          .catch((err) => {
-            console.error('resolveLocation failed', err);
-            setResolvedLocation({
-              country: null,
-              region: null,
-              city: null,
-              label: 'Unable to load map data',
-              lat: object.lat,
-              lon: object.lon,
-            });
-            setLocationResolving(false);
-          });
-        selectPoint({
-          coordinates: [object.lon, object.lat],
-          score: object.score,
-          hf: object.hf,
-          bd: object.bd,
-        });
-        flyTo(object.lon, object.lat);
-        return;
-      }
-      if (object && layer?.id === 'heatmap-dots') {
-        const [lon, lat] = object.coordinates;
+      const setResolvedAndSelect = (lon, lat, point, doFly = true) => {
         setClickCoordinate([lon, lat]);
         setLocationResolving(true);
         resolveLocation(lat, lon)
           .then((res) => {
             setResolvedLocation(res);
             setLocationResolving(false);
-            console.log('Click (heat dot)', { lat: res.lat.toFixed(4), lon: res.lon.toFixed(4), label: res.label });
           })
-          .catch((err) => {
-            console.error('resolveLocation failed', err);
-            setResolvedLocation({
-              country: null,
-              region: null,
-              city: null,
-              label: 'Unable to load map data',
-              lat,
-              lon,
-            });
+          .catch(() => {
+            setResolvedLocation({ country: null, region: null, city: null, label: 'Unable to load map data', lat, lon });
             setLocationResolving(false);
           });
-        selectPoint(object);
+        selectPoint(point);
+        if (doFly) flyTo(lon, lat);
+      };
+
+      const pointToSlot = (obj) => {
+        const lon = obj.lon ?? obj.coordinates?.[0];
+        const lat = obj.lat ?? obj.coordinates?.[1];
+        const resolvedPlace = obj.resolvedPlace ?? '';
+        return {
+          coordinates: [lon, lat],
+          lon,
+          lat,
+          score: obj.score,
+          hf: obj.hf,
+          bd: obj.bd,
+          resolvedPlace,
+        };
+      };
+
+      const isSamePoint = (slot, obj) => {
+        if (!slot) return false;
+        const lon = obj.lon ?? obj.coordinates?.[0];
+        const lat = obj.lat ?? obj.coordinates?.[1];
+        return slot.lon === lon && slot.lat === lat;
+      };
+
+      if (compareMode) {
+        if (object && (layer?.id === 'top-sites' || layer?.id === 'heatmap-dots')) {
+          const lon = object.lon ?? object.coordinates?.[0];
+          const lat = object.lat ?? object.coordinates?.[1];
+          const slot = pointToSlot({ ...object, lon, lat, resolvedPlace: object.resolvedPlace ?? '' });
+          if (isSamePoint(compareSlotA, slot)) {
+            setCompareSlotA(null);
+            return;
+          }
+          if (isSamePoint(compareSlotB, slot)) {
+            setCompareSlotB(null);
+            return;
+          }
+          if (!compareSlotA) {
+            setCompareSlotA(slot);
+            setResolvedAndSelect(lon, lat, { ...object, coordinates: [lon, lat], score: object.score, hf: object.hf, bd: object.bd }, true);
+            return;
+          }
+          if (!compareSlotB) {
+            setCompareSlotB(slot);
+            setResolvedAndSelect(lon, lat, { ...object, coordinates: [lon, lat], score: object.score, hf: object.hf, bd: object.bd }, true);
+            return;
+          }
+          setCompareSlotA(slot);
+          setCompareSlotB(null);
+          setResolvedAndSelect(lon, lat, { ...object, coordinates: [lon, lat], score: object.score, hf: object.hf, bd: object.bd }, true);
+          return;
+        }
+        if (coordinate) {
+          const [clickLon, clickLat] = coordinate;
+          const extent = filteredSites.length
+            ? filteredSites.reduce((acc, d) => ({ min: Math.min(acc.min, d.score ?? 0), max: Math.max(acc.max, d.score ?? 0) }), { min: Infinity, max: -Infinity })
+            : { min: 0, max: 1 };
+          const range = extent.max - extent.min || 1;
+          const norm = (s) => (Math.max(extent.min, Math.min(extent.max, s ?? 0)) - extent.min) / range;
+          const highOnly = filteredSites.filter((pt) => norm(pt.score) >= potentialThreshold);
+          let nearest = null;
+          let minDist = Infinity;
+          for (const pt of highOnly) {
+            const [lon, lat] = pt.coordinates;
+            const d = (lon - clickLon) ** 2 + (lat - clickLat) ** 2;
+            if (d < minDist) {
+              minDist = d;
+              nearest = pt;
+            }
+          }
+          if (nearest) {
+            const slot = pointToSlot(nearest);
+            if (isSamePoint(compareSlotA, slot)) {
+              setCompareSlotA(null);
+              return;
+            }
+            if (isSamePoint(compareSlotB, slot)) {
+              setCompareSlotB(null);
+              return;
+            }
+            if (!compareSlotA) {
+              setCompareSlotA(slot);
+              setResolvedAndSelect(nearest.coordinates[0], nearest.coordinates[1], nearest, true);
+              return;
+            }
+            if (!compareSlotB) {
+              setCompareSlotB(slot);
+              setResolvedAndSelect(nearest.coordinates[0], nearest.coordinates[1], nearest, true);
+              return;
+            }
+            setCompareSlotA(slot);
+            setCompareSlotB(null);
+            setResolvedAndSelect(nearest.coordinates[0], nearest.coordinates[1], nearest, true);
+          }
+        }
+        return;
+      }
+
+      if (object && layer?.id === 'top-sites') {
+        setResolvedAndSelect(object.lon, object.lat, {
+          coordinates: [object.lon, object.lat],
+          score: object.score,
+          hf: object.hf,
+          bd: object.bd,
+        });
+        return;
+      }
+      if (object && layer?.id === 'heatmap-dots') {
+        const [lon, lat] = object.coordinates;
+        setResolvedAndSelect(lon, lat, object);
         return;
       }
       if (!coordinate) return;
@@ -162,23 +331,14 @@ export default function GeothermalGlobe() {
         .then((res) => {
           setResolvedLocation(res);
           setLocationResolving(false);
-          console.log('Click', { lat: res.lat.toFixed(4), lon: res.lon.toFixed(4), label: res.label });
         })
-        .catch((err) => {
-          console.error('resolveLocation failed', err);
-          setResolvedLocation({
-            country: null,
-            region: null,
-            city: null,
-            label: 'Unable to load map data',
-            lat: clickLat,
-            lon: clickLon,
-          });
+        .catch(() => {
+          setResolvedLocation({ country: null, region: null, city: null, label: 'Unable to load map data', lat: clickLat, lon: clickLon });
           setLocationResolving(false);
         });
 
-      if (!data.length) return;
-      const extent = data.reduce(
+      if (!filteredSites.length) return;
+      const extent = filteredSites.reduce(
         (acc, d) => {
           const s = d.score ?? 0;
           return { min: Math.min(acc.min, s), max: Math.max(acc.max, s) };
@@ -187,7 +347,7 @@ export default function GeothermalGlobe() {
       );
       const range = extent.max - extent.min || 1;
       const norm = (s) => (Math.max(extent.min, Math.min(extent.max, s ?? 0)) - extent.min) / range;
-      const highOnly = data.filter((pt) => norm(pt.score) >= 0.5);
+      const highOnly = filteredSites.filter((pt) => norm(pt.score) >= potentialThreshold);
       let nearest = null;
       let minDist = Infinity;
       for (const pt of highOnly) {
@@ -200,7 +360,7 @@ export default function GeothermalGlobe() {
       }
       selectPoint(nearest);
     },
-    [data, selectPoint, flyTo]
+    [data, filteredSites, potentialThreshold, selectPoint, flyTo, compareMode, compareSlotA, compareSlotB]
   );
 
   const layers = useMemo(() => {
@@ -220,10 +380,9 @@ export default function GeothermalGlobe() {
       },
     });
 
-    // Normalize score to 0–1 over current data range for color scale
     const scoreExtent =
-      data.length > 0
-        ? data.reduce(
+      filteredSites.length > 0
+        ? filteredSites.reduce(
             (acc, d) => {
               const s = d.score ?? 0;
               return { min: Math.min(acc.min, s), max: Math.max(acc.max, s) };
@@ -234,12 +393,8 @@ export default function GeothermalGlobe() {
     const scoreRange = scoreExtent.max - scoreExtent.min || 1;
     const normalizeScore = (s) =>
       (Math.max(scoreExtent.min, Math.min(scoreExtent.max, s ?? 0)) - scoreExtent.min) / scoreRange;
+    const highPotentialData = filteredSites.filter((d) => normalizeScore(d.score) >= potentialThreshold);
 
-    // Only show yellow, orange, or red dots (normalized score >= 0.5)
-    const HIGH_POTENTIAL_THRESHOLD = 0.5;
-    const highPotentialData = data.filter((d) => normalizeScore(d.score) >= HIGH_POTENTIAL_THRESHOLD);
-
-    // Globe-compatible replacement for HeatmapLayer: scatter points colored by score
     const heatmapDots = new ScatterplotLayer({
       id: 'heatmap-dots',
       data: highPotentialData,
@@ -263,34 +418,29 @@ export default function GeothermalGlobe() {
         })
       : null;
 
+    const isSlotA = (d) => compareSlotA && d.lon === compareSlotA.lon && d.lat === compareSlotA.lat;
+    const isSlotB = (d) => compareSlotB && d.lon === compareSlotB.lon && d.lat === compareSlotB.lat;
     const pinsLayer = new ScatterplotLayer({
       id: 'top-sites',
-      data: topSites,
+      data: topSitesComputed,
       getPosition: (d) => [d.lon, d.lat],
-      getRadius: 7,
+      getRadius: (d) => (isSlotA(d) || isSlotB(d) ? 11 : 7),
       radiusUnits: 'pixels',
-      getFillColor: (d) =>
-        selected?.coordinates[0] === d.lon && selected?.coordinates[1] === d.lat
-          ? [255, 255, 255, 255]
-          : [255, 210, 0, 230],
-      getLineColor: [20, 20, 20, 200],
-      stroked: true,
-      lineWidthMinPixels: 1,
-      pickable: true,
-      updateTriggers: { getFillColor: [selected] },
-      onClick: ({ object }) => {
-        selectPoint({
-          coordinates: [object.lon, object.lat],
-          score: object.score,
-          hf: object.hf,
-          bd: object.bd,
-        });
-        flyTo(object.lon, object.lat);
+      getFillColor: (d) => {
+        if (isSlotA(d)) return [255, 255, 255, 255];
+        if (isSlotB(d)) return [255, 200, 100, 255];
+        if (selected?.coordinates?.[0] === d.lon && selected?.coordinates?.[1] === d.lat) return [255, 255, 255, 255];
+        return [255, 210, 0, 230];
       },
+      getLineColor: (d) => (isSlotA(d) || isSlotB(d) ? [255, 165, 0, 255] : [20, 20, 20, 200]),
+      stroked: true,
+      lineWidthMinPixels: 2,
+      pickable: true,
+      updateTriggers: { getFillColor: [selected, compareSlotA, compareSlotB], getRadius: [compareSlotA, compareSlotB] },
     });
 
     return [basemap, heatmapDots, boundaryLayer, pinsLayer].filter(Boolean);
-  }, [data, boundaries, topSites, showBoundaries, selected, selectPoint, flyTo]);
+  }, [data, boundaries, filteredSites, potentialThreshold, topSitesComputed, showBoundaries, selected, compareSlotA, compareSlotB]);
 
   const [selLon, selLat] = selected?.coordinates ?? [0, 0];
   const displayLat = resolvedLocation?.lat ?? clickCoordinate?.[1] ?? selLat;
@@ -445,35 +595,124 @@ export default function GeothermalGlobe() {
               background: 'rgba(8,8,18,0.95)',
             }}
           >
+            HIGH POTENTIAL THRESHOLD
+          </div>
+          <div style={{ padding: '8px 12px 12px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+            <div style={{ color: '#888', fontSize: 10, marginBottom: 4 }}>Threshold {potentialThreshold.toFixed(2)}</div>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={potentialThreshold}
+              onChange={(e) => setPotentialThreshold(Number(e.target.value))}
+              style={{ width: '100%', accentColor: '#f97316' }}
+            />
+          </div>
+
+          <div style={{ padding: '8px 12px', borderBottom: '1px solid rgba(255,255,255,0.06)', color: '#f97316', fontWeight: 'bold', fontSize: 10, letterSpacing: 2 }}>
+            REGION FILTERS
+          </div>
+          <div style={{ padding: '8px 12px 10px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+            <div style={{ marginBottom: 6 }}>
+              <label style={{ color: '#888', fontSize: 10, display: 'block', marginBottom: 2 }}>Continent</label>
+              <select
+                value={continentFilter}
+                onChange={(e) => setContinentFilter(e.target.value)}
+                style={{ width: '100%', padding: '4px 6px', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 4, color: '#e0e0e0', fontSize: 11 }}
+              >
+                {CONTINENT_OPTIONS.map((c) => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label style={{ color: '#888', fontSize: 10, display: 'block', marginBottom: 2 }}>Country</label>
+              <select
+                value={countryFilter}
+                onChange={(e) => setCountryFilter(e.target.value)}
+                style={{ width: '100%', padding: '4px 6px', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 4, color: '#e0e0e0', fontSize: 11 }}
+              >
+                <option value="All">All</option>
+                {uniqueCountries.map((c) => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div style={{ padding: '8px 12px', borderBottom: '1px solid rgba(255,255,255,0.06)', color: '#f97316', fontWeight: 'bold', fontSize: 10, letterSpacing: 2 }}>
+            COMPARE
+          </div>
+          <div style={{ padding: '8px 12px 10px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 8 }}>
+              <input type="checkbox" checked={compareMode} onChange={(e) => setCompareMode(e.target.checked)} style={{ accentColor: '#f97316' }} />
+              <span style={{ fontSize: 11, color: '#ddd' }}>Compare mode</span>
+            </label>
+            {compareMode && (
+              <p style={{ color: '#888', fontSize: 10, margin: '0 0 8px', lineHeight: 1.4 }}>
+                Click two points to compare, click again to unpin.
+              </p>
+            )}
+            <div style={{ fontSize: 10, color: '#888', marginBottom: 4 }}>Slot A: {compareSlotA ? `${compareSlotA.resolvedPlace || 'Selected'} (${(compareSlotA.score ?? 0).toFixed(3)})` : 'None selected'}</div>
+            <div style={{ fontSize: 10, color: '#888', marginBottom: 8 }}>Slot B: {compareSlotB ? `${compareSlotB.resolvedPlace || 'Selected'} (${(compareSlotB.score ?? 0).toFixed(3)})` : 'None selected'}</div>
+            <button
+              type="button"
+              onClick={() => { setCompareSlotA(null); setCompareSlotB(null); }}
+              style={{ background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 4, padding: '4px 10px', color: '#aaa', fontSize: 10, cursor: 'pointer' }}
+            >
+              Clear compare
+            </button>
+            {compareSlotA && compareSlotB && (
+              <div style={{ marginTop: 12, padding: 8, background: 'rgba(0,0,0,0.2)', borderRadius: 4 }}>
+                <div style={{ color: '#f97316', fontSize: 10, fontWeight: 'bold', marginBottom: 6 }}>Comparison</div>
+                <table style={{ width: '100%', fontSize: 10, borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ color: '#888' }}>
+                      <th style={{ textAlign: 'left', padding: '2px 4px' }}>Metric</th>
+                      <th style={{ textAlign: 'center', padding: '2px 4px' }}>A</th>
+                      <th style={{ textAlign: 'center', padding: '2px 4px' }}>B</th>
+                    </tr>
+                  </thead>
+                  <tbody style={{ color: '#ddd' }}>
+                    <tr><td style={{ padding: '2px 4px' }}>Score</td><td style={{ textAlign: 'center' }}>{(compareSlotA.score ?? 0).toFixed(4)}</td><td style={{ textAlign: 'center' }}>{(compareSlotB.score ?? 0).toFixed(4)}</td></tr>
+                    <tr><td style={{ padding: '2px 4px' }}>Heat flow (mW/m²)</td><td style={{ textAlign: 'center' }}>{compareSlotA.hf != null ? compareSlotA.hf : '—'}</td><td style={{ textAlign: 'center' }}>{compareSlotB.hf != null ? compareSlotB.hf : '—'}</td></tr>
+                    <tr><td style={{ padding: '2px 4px' }}>Boundary (km)</td><td style={{ textAlign: 'center' }}>{compareSlotA.bd != null ? compareSlotA.bd.toFixed(1) : '—'}</td><td style={{ textAlign: 'center' }}>{compareSlotB.bd != null ? compareSlotB.bd.toFixed(1) : '—'}</td></tr>
+                  </tbody>
+                </table>
+                <div style={{ marginTop: 6, fontSize: 10, color: '#b0b0b0' }}>
+                  Winner: {getWinnerExplanation(compareSlotA, compareSlotB)}
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div style={{ padding: '8px 12px 7px', color: '#f97316', fontWeight: 'bold', fontSize: 10, letterSpacing: 2 }}>
             TOP 20 SITES
           </div>
-          {topSites.map((site) => {
+          {topSitesComputed.map((site) => {
             const isActive =
-              selected?.coordinates[0] === site.lon &&
-              selected?.coordinates[1] === site.lat;
+              selected?.coordinates?.[0] === site.lon &&
+              selected?.coordinates?.[1] === site.lat;
             return (
               <div
-                key={site.rank}
+                key={`${site.rank}-${site.lon}-${site.lat}`}
                 onClick={() => {
                   setClickCoordinate([site.lon, site.lat]);
-                  setLocationResolving(true);
-                  resolveLocation(site.lat, site.lon)
-                    .then((res) => {
-                      setResolvedLocation(res);
-                      setLocationResolving(false);
-                    })
-                    .catch((err) => {
-                      console.error('resolveLocation failed', err);
-                      setResolvedLocation({
-                        country: null,
-                        region: null,
-                        city: null,
-                        label: 'Unable to load map data',
-                        lat: site.lat,
-                        lon: site.lon,
+                  if (site.resolvedPlace) {
+                    setResolvedLocation({ label: site.resolvedPlace, lat: site.lat, lon: site.lon });
+                  } else {
+                    setLocationResolving(true);
+                    resolveLocation(site.lat, site.lon)
+                      .then((res) => {
+                        setResolvedLocation(res);
+                        setLocationResolving(false);
+                      })
+                      .catch(() => {
+                        setResolvedLocation({ country: null, region: null, city: null, label: 'Unable to load map data', lat: site.lat, lon: site.lon });
+                        setLocationResolving(false);
                       });
-                      setLocationResolving(false);
-                    });
+                  }
                   selectPoint({
                     coordinates: [site.lon, site.lat],
                     score: site.score,
@@ -575,6 +814,7 @@ export default function GeothermalGlobe() {
           )}
         </div>
       )}
+      <InfoModal />
     </div>
   );
 }
